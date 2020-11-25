@@ -54,9 +54,6 @@
 #include "nordic_common.h"
 #include "nrf.h"
 #include "ble_hci.h"
-#include "ble_advdata.h"
-#include "ble_advertising.h"
-#include "ble_conn_params.h"
 #include "nrf_sdh.h"
 #include "nrf_sdh_soc.h"
 #include "nrf_sdh_ble.h"
@@ -64,6 +61,7 @@
 #include "app_timer.h"
 #include "ble_nus_c.h"
 #include "app_uart.h"
+#include "ble_db_discovery.h"
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
 #include "nrf_ble_scan.h"
@@ -308,50 +306,6 @@ static void db_disc_handler(ble_db_discovery_evt_t * p_evt)
 }
 
 
-/**@brief Function for handling characters received by the Nordic UART Service (NUS).
- *
- * @details This function takes a list of characters of length data_len and prints the characters out on UART.
- *          If @ref ECHOBACK_BLE_UART_DATA is set, the data is sent back to sender.
- */
-static void ble_nus_chars_received_uart_print(uint8_t * p_data, uint16_t data_len)
-{
-    ret_code_t ret_val;
-
-    NRF_LOG_DEBUG("Receiving data.");
-    NRF_LOG_HEXDUMP_DEBUG(p_data, data_len);
-
-    for (uint32_t i = 0; i < data_len; i++)
-    {
-        do
-        {
-            ret_val = app_uart_put(p_data[i]);
-            if ((ret_val != NRF_SUCCESS) && (ret_val != NRF_ERROR_BUSY))
-            {
-                NRF_LOG_ERROR("app_uart_put failed for index 0x%04x.", i);
-                APP_ERROR_CHECK(ret_val);
-            }
-        } while (ret_val == NRF_ERROR_BUSY);
-    }
-    if (p_data[data_len-1] == '\r')
-    {
-        while (app_uart_put('\n') == NRF_ERROR_BUSY);
-    }
-    if (ECHOBACK_BLE_UART_DATA)
-    {
-        // Send data back to the peripheral.
-        do
-        {
-            ret_val = ble_nus_c_string_send(&m_ble_nus_c, p_data, data_len);
-            if ((ret_val != NRF_SUCCESS) && (ret_val != NRF_ERROR_BUSY))
-            {
-                NRF_LOG_ERROR("Failed sending NUS message. Error 0x%x. ", ret_val);
-                APP_ERROR_CHECK(ret_val);
-            }
-        } while (ret_val == NRF_ERROR_BUSY);
-    }
-}
-
-
 /**@brief Callback handling Nordic UART Service (NUS) client events.
  *
  * @details This function is called to notify the application of NUS client events.
@@ -378,7 +332,7 @@ static void ble_nus_c_evt_handler(ble_nus_c_t * p_ble_nus_c, ble_nus_c_evt_t con
             break;
 
         case BLE_NUS_C_EVT_NUS_TX_EVT:
-            ble_nus_chars_received_uart_print(p_ble_nus_evt->p_data, p_ble_nus_evt->data_len);
+            app_usbd_cdc_acm_write(&m_app_cdc_acm, p_ble_nus_evt->p_data, p_ble_nus_evt->data_len);
             break;
 
         case BLE_NUS_C_EVT_DISCONNECTED:
@@ -397,36 +351,6 @@ static void timers_init(void)
     err_code = app_timer_create(&m_blink_ble, APP_TIMER_MODE_REPEATED, blink_handler);
     APP_ERROR_CHECK(err_code);
     err_code = app_timer_create(&m_blink_cdc, APP_TIMER_MODE_REPEATED, blink_handler);
-    APP_ERROR_CHECK(err_code);
-}
-
-/**
- * @brief Function for the GAP initialization.
- *
- * @details This function sets up all the necessary GAP (Generic Access Profile) parameters of
- *          the device. It also sets the permissions and appearance.
- */
-static void gap_params_init(void)
-{
-    uint32_t                err_code;
-    ble_gap_conn_params_t   gap_conn_params;
-    ble_gap_conn_sec_mode_t sec_mode;
-
-    BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
-
-    err_code = sd_ble_gap_device_name_set(&sec_mode,
-                                          (const uint8_t *) DEVICE_NAME,
-                                          strlen(DEVICE_NAME));
-    APP_ERROR_CHECK(err_code);
-
-    memset(&gap_conn_params, 0, sizeof(gap_conn_params));
-
-    gap_conn_params.min_conn_interval = MIN_CONN_INTERVAL;
-    gap_conn_params.max_conn_interval = MAX_CONN_INTERVAL;
-    gap_conn_params.slave_latency     = SLAVE_LATENCY;
-    gap_conn_params.conn_sup_timeout  = CONN_SUP_TIMEOUT;
-
-    err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -453,28 +377,6 @@ static void nus_c_init(void)
 static void conn_params_error_handler(uint32_t nrf_error)
 {
     APP_ERROR_HANDLER(nrf_error);
-}
-
-
-/** @brief Function for initializing the Connection Parameters module. */
-static void conn_params_init(void)
-{
-    uint32_t               err_code;
-    ble_conn_params_init_t cp_init;
-
-    memset(&cp_init, 0, sizeof(cp_init));
-
-    cp_init.p_conn_params                  = NULL;
-    cp_init.first_conn_params_update_delay = FIRST_CONN_PARAMS_UPDATE_DELAY;
-    cp_init.next_conn_params_update_delay  = NEXT_CONN_PARAMS_UPDATE_DELAY;
-    cp_init.max_conn_params_update_count   = MAX_CONN_PARAMS_UPDATE_COUNT;
-    cp_init.start_on_notify_cccd_handle    = BLE_GATT_HANDLE_INVALID;
-    cp_init.disconnect_on_fail             = true;
-    cp_init.evt_handler                    = NULL;
-    cp_init.error_handler                  = conn_params_error_handler;
-
-    err_code = ble_conn_params_init(&cp_init);
-    APP_ERROR_CHECK(err_code);
 }
 
 
@@ -734,6 +636,21 @@ static void log_init(void)
 }
 
 
+/** @brief Function for initializing the database discovery module. */
+static void db_discovery_init(void)
+{
+    ble_db_discovery_init_t db_init;
+
+    memset(&db_init, 0, sizeof(ble_db_discovery_init_t));
+
+    db_init.evt_handler  = db_disc_handler;
+    db_init.p_gatt_queue = &m_ble_gatt_queue;
+
+    ret_code_t err_code = ble_db_discovery_init(&db_init);
+    APP_ERROR_CHECK(err_code);
+}
+
+
 /** @brief Function for placing the application in low power state while waiting for events. */
 static void power_manage(void)
 {
@@ -943,7 +860,7 @@ int main(void)
     ret = nrf_drv_clock_init();
     APP_ERROR_CHECK(ret);
 
-    NRF_LOG_INFO("USBD BLE UART example started.");
+    NRF_LOG_INFO("USBD BLE UART C example started.");
 
     ret = app_usbd_init(&usbd_config);
     APP_ERROR_CHECK(ret);
@@ -952,13 +869,13 @@ int main(void)
     ret = app_usbd_class_append(class_cdc_acm);
     APP_ERROR_CHECK(ret);
 
+    db_discovery_init();
     ble_stack_init();
-    gap_params_init();
+ 
     gatt_init();
     nus_c_init();
+    
     scan_init();
-    conn_params_init();
-
     scan_start();
 
     ret = app_usbd_power_events_enable();
