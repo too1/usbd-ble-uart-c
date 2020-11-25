@@ -62,10 +62,11 @@
 #include "nrf_sdh_ble.h"
 #include "nrf_ble_gatt.h"
 #include "app_timer.h"
-#include "ble_nus.h"
+#include "ble_nus_c.h"
 #include "app_uart.h"
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
+#include "nrf_ble_scan.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
@@ -91,6 +92,8 @@
 #define LED_CDC_ACM_RX   (BSP_BOARD_LED_3)
 
 #define LED_BLINK_INTERVAL 800
+
+#define ECHOBACK_BLE_UART_DATA  1     
 
 APP_TIMER_DEF(m_blink_ble);
 APP_TIMER_DEF(m_blink_cdc);
@@ -160,9 +163,13 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
 #define UART_RX_BUF_SIZE                256                                         /**< UART RX buffer size. */
 
 
-BLE_NUS_DEF(m_nus, NRF_SDH_BLE_TOTAL_LINK_COUNT);                                   /**< BLE NUS service instance. */
-NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
-BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
+BLE_NUS_C_DEF(m_ble_nus_c);                                             /**< BLE Nordic UART Service (NUS) client instance. */
+NRF_BLE_GATT_DEF(m_gatt);                                               /**< GATT module instance. */
+BLE_DB_DISCOVERY_DEF(m_db_disc);                                        /**< Database discovery module instance. */
+NRF_BLE_SCAN_DEF(m_scan);                                               /**< Scanning Module instance. */
+NRF_BLE_GQ_DEF(m_ble_gatt_queue,                                        /**< BLE GATT Queue instance. */
+               NRF_SDH_BLE_CENTRAL_LINK_COUNT,
+               NRF_BLE_GQ_QUEUE_SIZE);
 
 static uint16_t   m_conn_handle          = BLE_CONN_HANDLE_INVALID;                 /**< Handle of the current connection. */
 static uint16_t   m_ble_nus_max_data_len = BLE_GATT_ATT_MTU_DEFAULT - 3;            /**< Maximum length of data (in bytes) that can be transmitted to the peer by the Nordic UART service module. */
@@ -170,6 +177,14 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 {
     {BLE_UUID_NUS_SERVICE, NUS_SERVICE_UUID_TYPE}
 };
+
+/**@brief NUS UUID. */
+static ble_uuid_t const m_nus_uuid =
+{
+    .uuid = BLE_UUID_NUS_SERVICE,
+    .type = NUS_SERVICE_UUID_TYPE
+};
+
 static char m_nus_data_array[BLE_NUS_MAX_DATA_LEN];
 
 // BLE DEFINES END
@@ -190,6 +205,189 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 {
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
+
+
+/**@brief Function for handling the Nordic UART Service Client errors.
+ *
+ * @param[in]   nrf_error   Error code containing information about what went wrong.
+ */
+static void nus_error_handler(uint32_t nrf_error)
+{
+    APP_ERROR_HANDLER(nrf_error);
+}
+
+
+/**@brief Function to start scanning. */
+static void scan_start(void)
+{
+    ret_code_t ret;
+
+    ret = nrf_ble_scan_start(&m_scan);
+    APP_ERROR_CHECK(ret);
+
+    ret = bsp_indication_set(BSP_INDICATE_SCANNING);
+    APP_ERROR_CHECK(ret);
+}
+
+
+/**@brief Function for handling Scanning Module events.
+ */
+static void scan_evt_handler(scan_evt_t const * p_scan_evt)
+{
+    ret_code_t err_code;
+
+    switch(p_scan_evt->scan_evt_id)
+    {
+         case NRF_BLE_SCAN_EVT_CONNECTING_ERROR:
+         {
+              err_code = p_scan_evt->params.connecting_err.err_code;
+              APP_ERROR_CHECK(err_code);
+         } break;
+
+         case NRF_BLE_SCAN_EVT_CONNECTED:
+         {
+              ble_gap_evt_connected_t const * p_connected =
+                               p_scan_evt->params.connected.p_connected;
+             // Scan is automatically stopped by the connection.
+             NRF_LOG_INFO("Connecting to target %02x%02x%02x%02x%02x%02x",
+                      p_connected->peer_addr.addr[0],
+                      p_connected->peer_addr.addr[1],
+                      p_connected->peer_addr.addr[2],
+                      p_connected->peer_addr.addr[3],
+                      p_connected->peer_addr.addr[4],
+                      p_connected->peer_addr.addr[5]
+                      );
+         } break;
+
+         case NRF_BLE_SCAN_EVT_SCAN_TIMEOUT:
+         {
+             NRF_LOG_INFO("Scan timed out.");
+             scan_start();
+         } break;
+
+         default:
+             break;
+    }
+}
+
+
+/**@brief Function for initializing the scanning and setting the filters.
+ */
+static void scan_init(void)
+{
+    ret_code_t          err_code;
+    nrf_ble_scan_init_t init_scan;
+
+    memset(&init_scan, 0, sizeof(init_scan));
+
+    init_scan.connect_if_match = true;
+    init_scan.conn_cfg_tag     = APP_BLE_CONN_CFG_TAG;
+
+    err_code = nrf_ble_scan_init(&m_scan, &init_scan, scan_evt_handler);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrf_ble_scan_filter_set(&m_scan, SCAN_UUID_FILTER, &m_nus_uuid);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = nrf_ble_scan_filters_enable(&m_scan, NRF_BLE_SCAN_UUID_FILTER, false);
+    APP_ERROR_CHECK(err_code);
+}
+
+
+/**@brief Function for handling database discovery events.
+ *
+ * @details This function is a callback function to handle events from the database discovery module.
+ *          Depending on the UUIDs that are discovered, this function forwards the events
+ *          to their respective services.
+ *
+ * @param[in] p_event  Pointer to the database discovery event.
+ */
+static void db_disc_handler(ble_db_discovery_evt_t * p_evt)
+{
+    ble_nus_c_on_db_disc_evt(&m_ble_nus_c, p_evt);
+}
+
+
+/**@brief Function for handling characters received by the Nordic UART Service (NUS).
+ *
+ * @details This function takes a list of characters of length data_len and prints the characters out on UART.
+ *          If @ref ECHOBACK_BLE_UART_DATA is set, the data is sent back to sender.
+ */
+static void ble_nus_chars_received_uart_print(uint8_t * p_data, uint16_t data_len)
+{
+    ret_code_t ret_val;
+
+    NRF_LOG_DEBUG("Receiving data.");
+    NRF_LOG_HEXDUMP_DEBUG(p_data, data_len);
+
+    for (uint32_t i = 0; i < data_len; i++)
+    {
+        do
+        {
+            ret_val = app_uart_put(p_data[i]);
+            if ((ret_val != NRF_SUCCESS) && (ret_val != NRF_ERROR_BUSY))
+            {
+                NRF_LOG_ERROR("app_uart_put failed for index 0x%04x.", i);
+                APP_ERROR_CHECK(ret_val);
+            }
+        } while (ret_val == NRF_ERROR_BUSY);
+    }
+    if (p_data[data_len-1] == '\r')
+    {
+        while (app_uart_put('\n') == NRF_ERROR_BUSY);
+    }
+    if (ECHOBACK_BLE_UART_DATA)
+    {
+        // Send data back to the peripheral.
+        do
+        {
+            ret_val = ble_nus_c_string_send(&m_ble_nus_c, p_data, data_len);
+            if ((ret_val != NRF_SUCCESS) && (ret_val != NRF_ERROR_BUSY))
+            {
+                NRF_LOG_ERROR("Failed sending NUS message. Error 0x%x. ", ret_val);
+                APP_ERROR_CHECK(ret_val);
+            }
+        } while (ret_val == NRF_ERROR_BUSY);
+    }
+}
+
+
+/**@brief Callback handling Nordic UART Service (NUS) client events.
+ *
+ * @details This function is called to notify the application of NUS client events.
+ *
+ * @param[in]   p_ble_nus_c   NUS client handle. This identifies the NUS client.
+ * @param[in]   p_ble_nus_evt Pointer to the NUS client event.
+ */
+
+/**@snippet [Handling events from the ble_nus_c module] */
+static void ble_nus_c_evt_handler(ble_nus_c_t * p_ble_nus_c, ble_nus_c_evt_t const * p_ble_nus_evt)
+{
+    ret_code_t err_code;
+
+    switch (p_ble_nus_evt->evt_type)
+    {
+        case BLE_NUS_C_EVT_DISCOVERY_COMPLETE:
+            NRF_LOG_INFO("Discovery complete.");
+            err_code = ble_nus_c_handles_assign(p_ble_nus_c, p_ble_nus_evt->conn_handle, &p_ble_nus_evt->handles);
+            APP_ERROR_CHECK(err_code);
+
+            err_code = ble_nus_c_tx_notif_enable(p_ble_nus_c);
+            APP_ERROR_CHECK(err_code);
+            NRF_LOG_INFO("Connected to device with Nordic UART Service.");
+            break;
+
+        case BLE_NUS_C_EVT_NUS_TX_EVT:
+            ble_nus_chars_received_uart_print(p_ble_nus_evt->p_data, p_ble_nus_evt->data_len);
+            break;
+
+        case BLE_NUS_C_EVT_DISCONNECTED:
+            NRF_LOG_INFO("Disconnected.");
+            scan_start();
+            break;
+    }
+}
+
 
 /** @brief Function for initializing the timer module. */
 static void timers_init(void)
@@ -233,56 +431,17 @@ static void gap_params_init(void)
 }
 
 
-/**
- * @brief Function for handling the data from the Nordic UART Service.
- *
- * @details This function processes the data received from the Nordic UART BLE Service and sends
- *          it to the USBD CDC ACM module.
- *
- * @param[in] p_evt Nordic UART Service event.
- */
-static void nus_data_handler(ble_nus_evt_t * p_evt)
+/**@brief Function for initializing the Nordic UART Service (NUS) client. */
+static void nus_c_init(void)
 {
+    ret_code_t       err_code;
+    ble_nus_c_init_t init;
 
-    if (p_evt->type == BLE_NUS_EVT_RX_DATA)
-    {
-        bsp_board_led_invert(LED_BLE_NUS_RX);
-        NRF_LOG_DEBUG("Received data from BLE NUS. Writing data on CDC ACM.");
-        NRF_LOG_HEXDUMP_DEBUG(p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
-        memcpy(m_nus_data_array, p_evt->params.rx_data.p_data, p_evt->params.rx_data.length);
+    init.evt_handler   = ble_nus_c_evt_handler;
+    init.error_handler = nus_error_handler;
+    init.p_gatt_queue  = &m_ble_gatt_queue;
 
-        // Add endline characters
-        uint16_t length = p_evt->params.rx_data.length;
-        if (length + sizeof(ENDLINE_STRING) < BLE_NUS_MAX_DATA_LEN)
-        {
-            memcpy(m_nus_data_array + length, ENDLINE_STRING, sizeof(ENDLINE_STRING));
-            length += sizeof(ENDLINE_STRING);
-        }
-
-        // Send data through CDC ACM
-        ret_code_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm,
-                                                m_nus_data_array,
-                                                length);
-        if(ret != NRF_SUCCESS)
-        {
-            NRF_LOG_INFO("CDC ACM unavailable, data received: %s", m_nus_data_array);
-        }
-    }
-
-}
-
-
-/** @brief Function for initializing services that will be used by the application. */
-static void services_init(void)
-{
-    uint32_t       err_code;
-    ble_nus_init_t nus_init;
-
-    memset(&nus_init, 0, sizeof(nus_init));
-
-    nus_init.data_handler = nus_data_handler;
-
-    err_code = ble_nus_init(&m_nus, &nus_init);
+    err_code = ble_nus_c_init(&m_ble_nus_c, &init);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -339,42 +498,6 @@ static void sleep_mode_enter(void)
 }
 
 
-/** @brief Function for starting advertising. */
-static void advertising_start(void)
-{
-    uint32_t err_code = ble_advertising_start(&m_advertising, BLE_ADV_MODE_FAST);
-    APP_ERROR_CHECK(err_code);
-}
-
-/**
- * @brief Function for handling advertising events.
- *
- * @details This function is called for advertising events which are passed to the application.
- *
- * @param[in] ble_adv_evt  Advertising event.
- */
-static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
-{
-    uint32_t err_code;
-
-    switch (ble_adv_evt)
-    {
-        case BLE_ADV_EVT_FAST:
-            err_code = app_timer_start(m_blink_ble,
-                                       APP_TIMER_TICKS(LED_BLINK_INTERVAL),
-                                       (void *) LED_BLE_NUS_CONN);
-            APP_ERROR_CHECK(err_code);
-            break;
-        case BLE_ADV_EVT_IDLE:
-            NRF_LOG_INFO("Advertising timeout, restarting.")
-            advertising_start();
-            break;
-        default:
-            break;
-    }
-}
-
-
 /**
  * @brief Function for handling BLE events.
  *
@@ -393,6 +516,16 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             APP_ERROR_CHECK(err_code);
             bsp_board_led_on(LED_BLE_NUS_CONN);
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
+
+            err_code = ble_nus_c_handles_assign(&m_ble_nus_c, p_ble_evt->evt.gap_evt.conn_handle, NULL);
+            APP_ERROR_CHECK(err_code);
+
+            err_code = bsp_indication_set(BSP_INDICATE_CONNECTED);
+            APP_ERROR_CHECK(err_code);
+
+            // start discovery of services. The NUS Client waits for a discovery result
+            err_code = ble_db_discovery_start(&m_db_disc, p_ble_evt->evt.gap_evt.conn_handle);
+            APP_ERROR_CHECK(err_code);
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
@@ -416,6 +549,13 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
         case BLE_GAP_EVT_SEC_PARAMS_REQUEST:
             // Pairing not supported.
             err_code = sd_ble_gap_sec_params_reply(m_conn_handle, BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP, NULL, NULL);
+            APP_ERROR_CHECK(err_code);
+            break;
+
+        case BLE_GAP_EVT_CONN_PARAM_UPDATE_REQUEST:
+            // Accepting parameters requested by peer.
+            err_code = sd_ble_gap_conn_param_update(p_ble_evt->evt.gap_evt.conn_handle,
+                                                    &p_ble_evt->evt.gap_evt.params.conn_param_update_request.conn_params);
             APP_ERROR_CHECK(err_code);
             break;
 
@@ -567,46 +707,12 @@ void bsp_event_handler(bsp_event_t event)
             break;
 
         case BSP_EVENT_WHITELIST_OFF:
-            if (m_conn_handle == BLE_CONN_HANDLE_INVALID)
-            {
-                err_code = ble_advertising_restart_without_whitelist(&m_advertising);
-                if (err_code != NRF_ERROR_INVALID_STATE)
-                {
-                    APP_ERROR_CHECK(err_code);
-                }
-            }
+
             break;
 
         default:
             break;
     }
-}
-
-/** @brief Function for initializing the Advertising functionality. */
-static void advertising_init(void)
-{
-    uint32_t               err_code;
-    ble_advertising_init_t init;
-
-    memset(&init, 0, sizeof(init));
-
-    init.advdata.name_type          = BLE_ADVDATA_FULL_NAME;
-    init.advdata.include_appearance = false;
-    init.advdata.flags              = BLE_GAP_ADV_FLAGS_LE_ONLY_LIMITED_DISC_MODE;
-
-    init.srdata.uuids_complete.uuid_cnt = sizeof(m_adv_uuids) / sizeof(m_adv_uuids[0]);
-    init.srdata.uuids_complete.p_uuids  = m_adv_uuids;
-
-    init.config.ble_adv_fast_enabled  = true;
-    init.config.ble_adv_fast_interval = APP_ADV_INTERVAL;
-    init.config.ble_adv_fast_timeout  = APP_ADV_DURATION;
-
-    init.evt_handler = on_adv_evt;
-
-    err_code = ble_advertising_init(&m_advertising, &init);
-    APP_ERROR_CHECK(err_code);
-
-    ble_advertising_conn_cfg_tag_set(&m_advertising, APP_BLE_CONN_CFG_TAG);
 }
 
 
@@ -715,10 +821,8 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
                                 length += sizeof(ENDLINE_STRING);
                             }
 
-                            ret = ble_nus_data_send(&m_nus,
-                                                    (uint8_t *) m_cdc_data_array,
-                                                    &length,
-                                                    m_conn_handle);
+                            ret = ble_nus_c_string_send(&m_ble_nus_c,
+                                                    (uint8_t *) m_cdc_data_array, length);
 
                             if (ret == NRF_ERROR_NOT_FOUND)
                             {
@@ -851,12 +955,11 @@ int main(void)
     ble_stack_init();
     gap_params_init();
     gatt_init();
-    services_init();
-    advertising_init();
+    nus_c_init();
+    scan_init();
     conn_params_init();
 
-    // Start execution.
-    advertising_start();
+    scan_start();
 
     ret = app_usbd_power_events_enable();
     APP_ERROR_CHECK(ret);
