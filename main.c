@@ -75,6 +75,7 @@
 #include "nrf_gpio.h"
 #include "nrf_delay.h"
 #include "nrf_drv_power.h"
+#include "nrf_queue.h"
 
 #include "app_error.h"
 #include "app_util.h"
@@ -186,6 +187,19 @@ static ble_uuid_t const m_nus_uuid =
 static char m_nus_data_array[BLE_NUS_MAX_DATA_LEN];
 
 // BLE DEFINES END
+
+// RX CDC Data buffer variables
+#define RX_BUF_SIZE 64
+#define RX_BUF_NUM  8
+
+static uint8_t  m_rx_buf[RX_BUF_SIZE * RX_BUF_NUM];
+static uint32_t m_rx_buf_next_free_index = 0;
+static uint32_t m_rx_buf_filled_num = 0;
+#define RX_BUF_PTR_FROM_INDEX(a)(&m_rx_buf[a * RX_BUF_SIZE])
+
+NRF_QUEUE_DEF(uint8_t*, m_rx_buf_queue, RX_BUF_NUM, NRF_QUEUE_MODE_NO_OVERFLOW); 
+
+// RX CDC Data buffer variable end
 
 /**
  * @brief Function for assert macro callback.
@@ -674,6 +688,18 @@ static void idle_state_handle(void)
 // USB CODE START
 static bool m_usb_connected = false;
 
+static void push_next_buffer_to_usb(void)
+{
+    uint8_t *buf;
+    uint32_t ret = app_usbd_cdc_acm_read(&m_app_cdc_acm,
+                                RX_BUF_PTR_FROM_INDEX(m_rx_buf_next_free_index),
+                                RX_BUF_SIZE);
+    NRF_LOG_INFO("Buffering 64 bytes: Ret code %x", ret);
+    buf = RX_BUF_PTR_FROM_INDEX(m_rx_buf_next_free_index);
+    nrf_queue_push(&m_rx_buf_queue, (void *)&buf);
+    m_rx_buf_next_free_index = (m_rx_buf_next_free_index + 1) % RX_BUF_NUM;
+}
+
 
 /** @brief User event handler @ref app_usbd_cdc_acm_user_ev_handler_t */
 static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
@@ -685,15 +711,14 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
     {
         case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN:
         {
-            /*Set up the first transfer*/
-            ret_code_t ret = app_usbd_cdc_acm_read(&m_app_cdc_acm,
-                                                   m_cdc_data_array,
-                                                   1);
-            UNUSED_VARIABLE(ret);
-            ret = app_timer_stop(m_blink_cdc);
+            uint32_t ret = app_timer_stop(m_blink_cdc);
             APP_ERROR_CHECK(ret);
             bsp_board_led_on(LED_CDC_ACM_CONN);
             NRF_LOG_INFO("CDC ACM port opened");
+            
+            /*Prepare the first two transfers*/
+            push_next_buffer_to_usb();            
+            push_next_buffer_to_usb();
             break;
         }
 
@@ -714,71 +739,15 @@ static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
         case APP_USBD_CDC_ACM_USER_EVT_RX_DONE:
         {
             ret_code_t ret;
-            static uint8_t index = 0;
-            index++;
 
-            do
+            // Increment the RX filled buffer counter
+            m_rx_buf_filled_num++;
+
+            // If there is room in the queue, provide the next buffer to the CDC driver
+            if(!nrf_queue_is_full(&m_rx_buf_queue))
             {
-                if ((m_cdc_data_array[index - 1] == '\n') ||
-                    (m_cdc_data_array[index - 1] == '\r') ||
-                    (index >= (m_ble_nus_max_data_len)))
-                {
-                    if (index > 1)
-                    {
-                        bsp_board_led_invert(LED_CDC_ACM_RX);
-                        NRF_LOG_DEBUG("Ready to send data over BLE NUS");
-                        NRF_LOG_HEXDUMP_DEBUG(m_cdc_data_array, index);
-
-                        do
-                        {
-                            uint16_t length = (uint16_t)index;
-                            if (length + sizeof(ENDLINE_STRING) < BLE_NUS_MAX_DATA_LEN)
-                            {
-                                memcpy(m_cdc_data_array + length, ENDLINE_STRING, sizeof(ENDLINE_STRING));
-                                length += sizeof(ENDLINE_STRING);
-                            }
-
-                            ret = ble_nus_c_string_send(&m_ble_nus_c,
-                                                    (uint8_t *) m_cdc_data_array, length);
-
-                            if (ret == NRF_ERROR_NOT_FOUND)
-                            {
-                                NRF_LOG_INFO("BLE NUS unavailable, data received: %s", m_cdc_data_array);
-                                break;
-                            }
-
-                            if (ret == NRF_ERROR_RESOURCES)
-                            {
-                                NRF_LOG_ERROR("BLE NUS Too many notifications queued.");
-                                break;
-                            }
-
-                            if ((ret != NRF_ERROR_INVALID_STATE) && (ret != NRF_ERROR_BUSY))
-                            {
-                                APP_ERROR_CHECK(ret);
-                            }
-                        }
-                        while (ret == NRF_ERROR_BUSY);
-                    }
-
-                    index = 0;
-                }
-
-                /*Get amount of data transferred*/
-                size_t size = app_usbd_cdc_acm_rx_size(p_cdc_acm);
-                NRF_LOG_DEBUG("RX: size: %lu char: %c", size, m_cdc_data_array[index - 1]);
-
-                /* Fetch data until internal buffer is empty */
-                ret = app_usbd_cdc_acm_read(&m_app_cdc_acm,
-                                            &m_cdc_data_array[index],
-                                            1);
-                if (ret == NRF_SUCCESS)
-                {
-                    index++;
-                }
+                push_next_buffer_to_usb();           
             }
-            while (ret == NRF_SUCCESS);
-
             break;
         }
         default:
@@ -842,6 +811,7 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event)
 
 // USB CODE END
 
+
 /** @brief Application main function. */
 int main(void)
 {
@@ -888,6 +858,28 @@ int main(void)
         {
             /* Nothing to do */
         }
+
+        while(m_rx_buf_filled_num > 0)
+        {
+            uint8_t *buf;
+
+            // Find the next filled buffer in the queue, without popping it
+            nrf_queue_peek(&m_rx_buf_queue, &buf);
+
+            // Print the data to the log, and wait for the operation to finish
+            // This will slow down the USB transfer and show that the flow control is working
+            // Replace this with faster processing to test data throughput
+            NRF_LOG_HEXDUMP_INFO(buf, 64);
+            NRF_LOG_FLUSH();
+
+            // Once the buffer is successfully processed it can be popped,
+            // allowing the CDC driver to reuse the buffer
+            nrf_queue_pop(&m_rx_buf_queue, &buf);
+            
+            // Decrement the buf filled counter
+            m_rx_buf_filled_num--;
+        }
+        
         idle_state_handle();
     }
 }
